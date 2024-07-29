@@ -8,13 +8,11 @@ import com.maxrybalkin91.transactions.util.DbSettings.DB_PASSWORD
 import com.maxrybalkin91.transactions.util.DbSettings.DB_URL
 import com.maxrybalkin91.transactions.util.DbSettings.DB_USER
 import jakarta.annotation.PostConstruct
-import org.h2.jdbc.JdbcSQLTimeoutException
 import org.junit.jupiter.api.Assertions
 import org.junit.jupiter.api.Order
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.context.SpringBootTest
-import org.springframework.dao.PessimisticLockingFailureException
 import org.springframework.test.annotation.DirtiesContext
 import java.sql.Connection
 import java.sql.DriverManager
@@ -25,7 +23,7 @@ import java.sql.ResultSet
  */
 
 @SpringBootTest
-open class ReadUncommitedTests(
+open class RepeatableReadTests(
     @Autowired private val accountRepository: AccountRepository,
     @Autowired private val accountService: AccountService,
     @Autowired private val itemRepository: ItemRepository,
@@ -119,7 +117,7 @@ open class ReadUncommitedTests(
         try {
             conn1.autoCommit = false
 
-            var account = accountRepository.findById(1L).orElseThrow { AssertionError("No account found") }
+            val account = accountRepository.findById(1L).orElseThrow { AssertionError("No account found") }
 
             reduceBalance(conn1, 500)
             conn1.prepareStatement("delete from account where id = 1").executeUpdate()
@@ -127,12 +125,12 @@ open class ReadUncommitedTests(
 
             val finalBalance = account.balance + 1000
             account.balance = finalBalance
-            account = accountRepository.save(account)
+            accountRepository.save(account)
 
             Assertions.assertThrows(AssertionError::class.java) {
                 Assertions.assertTrue(accountRepository.count() == 0L)
             }
-            Assertions.assertTrue(accountRepository.findById(account.id).get().balance == finalBalance)
+            Assertions.assertTrue(accountRepository.findAll()[0].balance == finalBalance)
         } catch (e: Exception) {
             Assertions.fail("Unexpected exception", e)
         } finally {
@@ -200,92 +198,6 @@ open class ReadUncommitedTests(
         } finally {
             conn1.close()
             conn2.close()
-        }
-    }
-
-    //THERE ARE POSITIVE SCENARIOS TOO:)
-
-    /**
-     * There is 500$ on the bank account. A man in a bank office
-     * getting all the money from the account (500$).
-     * At the same time his wife is in another office adds 1000$ to the account.
-     *
-     * Now to add 1000$ we use SQL updating.
-     *
-     * Since the first transaction isn't commited yet, updating isn't possible.
-     * ReadCommited level blocks a row from other transaction updates
-     *
-     * Having 1500$ in temporary impossible; at least not possible in the first wife's reading
-     */
-    @Test
-    @DirtiesContext
-    fun `reading in T1, updating and deleting in T2, and updating in T1 via SQL`() {
-        val conn1 = DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD)
-        val conn2 = DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD)
-        try {
-            conn1.autoCommit = false
-            conn2.autoCommit = false
-
-            val accRead1 = getAccount(conn1)
-            val accRead2 = getAccount(conn2)
-
-            accRead1.next()
-            accRead2.next()
-
-            val balanceRead1 = accRead1.getInt(1)
-            val balanceRead2 = accRead1.getInt(1)
-
-            reduceBalance(conn1, balanceRead1)
-
-            Assertions.assertThrows(JdbcSQLTimeoutException::class.java) {
-                conn2.prepareStatement("update account set balance = ${balanceRead2 + 1000} where id = 1")
-                    .executeUpdate()
-            }
-        } catch (e: Exception) {
-            Assertions.fail("Unexpected exception", e)
-        } finally {
-            conn1.close()
-            conn2.close()
-        }
-    }
-
-    /**
-     * There is 500$ on the bank account. A man in a bank office
-     * getting all the money from the account (500$).
-     * At the same time his wife is in another office adds 1000$ to the account.
-     *
-     * Now to add 1000$ we use @Transactional updating.
-     *
-     * Since the first transaction isn't commited yet, updating isn't possible.
-     * ReadCommited level blocks a row from other transaction updates
-     *
-     * Having 1500$ in temporary impossible; at least not possible in the first wife's reading
-     */
-    @Test
-    @DirtiesContext
-    fun `reading in T1, updating and deleting in T2, and updating in T1 via Spring Transaction`() {
-        val conn1 = DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD)
-        try {
-            conn1.autoCommit = false
-
-            val accRead1 = getAccount(conn1)
-
-            accRead1.next()
-
-            val balanceRead1 = accRead1.getInt(1)
-            val balanceRead2 = accountRepository.findById(1L).get()
-
-            reduceBalance(conn1, balanceRead1)
-
-            balanceRead2.balance += 1000
-
-            Assertions.assertThrows(PessimisticLockingFailureException::class.java) {
-                accountService.saveReadCommited(balanceRead2)
-            }
-        } catch (e: Exception) {
-            Assertions.fail("Unexpected exception", e)
-        } finally {
-            conn1.close()
         }
     }
 
