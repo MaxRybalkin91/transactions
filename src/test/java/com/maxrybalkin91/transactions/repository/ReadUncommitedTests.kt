@@ -1,35 +1,25 @@
 package com.maxrybalkin91.transactions.repository
 
 import com.maxrybalkin91.transactions.model.Account
-import com.maxrybalkin91.transactions.model.Item
-import com.maxrybalkin91.transactions.service.AccountService
-import com.maxrybalkin91.transactions.service.ItemService
 import com.maxrybalkin91.transactions.util.DbSettings.DB_PASSWORD
 import com.maxrybalkin91.transactions.util.DbSettings.DB_URL
 import com.maxrybalkin91.transactions.util.DbSettings.DB_USER
 import jakarta.annotation.PostConstruct
-import org.h2.jdbc.JdbcSQLTimeoutException
 import org.junit.jupiter.api.Assertions
 import org.junit.jupiter.api.Order
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.context.SpringBootTest
-import org.springframework.dao.PessimisticLockingFailureException
 import org.springframework.test.annotation.DirtiesContext
 import java.sql.Connection
 import java.sql.DriverManager
-import java.sql.ResultSet
 
 /**
- * "Read Commited" isolation level cases
+ * "Read Uncommited" isolation level cases
  */
-
 @SpringBootTest
 open class ReadUncommitedTests(
-    @Autowired private val accountRepository: AccountRepository,
-    @Autowired private val accountService: AccountService,
-    @Autowired private val itemRepository: ItemRepository,
-    @Autowired private val itemService: ItemService,
+    @Autowired private val accountRepository: AccountRepository
 ) {
     @PostConstruct
     fun fillDb() {
@@ -44,243 +34,39 @@ open class ReadUncommitedTests(
     }
 
     /**
-     * There is 500$ on the bank account. A man checks it on an ATM
-     * and then withdraws 250$ of cash. At the same time his wife checks
-     * the balance on the mobile app as 500$, and decides to spend 250$ on Amazon.
-     *
-     * Due to bad application's architecture, it executes update with data was read before.
-     *
-     * Man's cash withdrawal transaction commit happens right after wife's balance checking.
-     * Wife's transaction commits and updates the balance as (!) HER APP 500$ shown - 250$ transaction.
-     *
-     * Now the balance on the account is 250$ instead of 0$
-     * (but we had two 250$ transactions, not one)
-     *
-     * The bank just lost 250$.
-     */
-    @Test
-    @DirtiesContext
-    fun `lost update due to commiting T1 after reading in T2`() {
-        val conn1 = DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD)
-        val conn2 = DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD)
-        try {
-            conn1.autoCommit = false
-            conn2.autoCommit = false
-
-            val rs1: ResultSet = getAccount(conn1)
-            if (rs1.next()) {
-                reduceBalance(conn1, rs1.getInt("balance") - 250)
-            }
-
-            val rs2: ResultSet = getAccount(conn2)
-            if (rs2.next()) {
-                conn1.commit()
-                reduceBalance(conn2, rs2.getInt("balance") - 250)
-                conn2.commit()
-            }
-            DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD).use { conn3 ->
-                val readStmt = conn3.prepareStatement("select * from account where id = ?")
-                readStmt.setInt(1, 1)
-                val rs = readStmt.executeQuery()
-                if (rs.next()) {
-                    val currentBalance = rs.getInt("balance")
-                    Assertions.assertThrows(AssertionError::class.java) {
-                        Assertions.assertEquals(0, currentBalance)
-                    }
-                } else {
-                    Assertions.fail<Any>("No account found")
-                }
-            }
-        } catch (e: Exception) {
-            Assertions.fail("Unexpected exception", e)
-        } finally {
-            conn1.close()
-            conn2.close()
-        }
-    }
-
-    /**
      * There is 500$ on the bank account. A man in a bank office
-     * getting all the money from the account (500$) and decides to close the account.
-     * At the same time his wife is in another office adds 1000$ to the account.
+     * Two people transfer 100$ simultaneously
+     * One transfer is commited, one is done with rollback because of lost connection
      *
-     * Due to bad application's design, there are two bugs:
-     * 1) it uses read data to calculate balance updating amount
-     * 2) it calls a JPA repository save without a transaction
-     *
-     * Wife's transaction commits and saves the account
-     * Now it's another account (new id) with 1500$ on it.
-     * The bank is about to lose 500$ of cash it gave to the man.
+     * But we successfully read uncommited data before it's abortion
+     * Therefore, we will see 700$ instead of 600$
+     * We just gave 100$ for charity
      */
     @Test
     @DirtiesContext
-    fun `reading in T1, updating and deleting in T2, and saving in T1 via JPA`() {
-        val conn1 = DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD)
-        try {
-            conn1.autoCommit = false
-
-            var account = accountRepository.findById(1L).orElseThrow { AssertionError("No account found") }
-
-            reduceBalance(conn1, 500)
-            conn1.prepareStatement("delete from account where id = 1").executeUpdate()
-            conn1.commit()
-
-            val finalBalance = account.balance + 1000
-            account.balance = finalBalance
-            account = accountRepository.save(account)
-
-            Assertions.assertThrows(AssertionError::class.java) {
-                Assertions.assertTrue(accountRepository.count() == 0L)
-            }
-            Assertions.assertTrue(accountRepository.findById(account.id).get().balance == finalBalance)
-        } catch (e: Exception) {
-            Assertions.fail("Unexpected exception", e)
-        } finally {
-            conn1.close()
-        }
-    }
-
-    /**
-     * A customer checks if there is an item available at an online store.
-     * His first request shows there is nothing.
-     *
-     * In a few minutes a manager adds it as available into the DB.
-     * Another customer opens the website and orders the same item.
-     *
-     * During the second's customer actions, the first customer also sees the item available and orders it.
-     *
-     * As a result, the first customer won't get his item, and in the DB the quantity will be negative.
-     * As well the first customer's feedback.
-     */
-    @Test
-    @DirtiesContext
-    fun `reading in T1, inserting and updating in T2, reading in T1 again`() {
+    fun `reading, updating in both T1 and T2, only T2 result is seen after`() {
         val conn1 = DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD)
         val conn2 = DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD)
         try {
             conn1.autoCommit = false
+            conn1.transactionIsolation = Connection.TRANSACTION_READ_UNCOMMITTED
             conn2.autoCommit = false
+            conn2.transactionIsolation = Connection.TRANSACTION_READ_UNCOMMITTED
 
-            val selectStatement = "select * from items where id = 1 and store_id = 1 and quantity > 0"
+            val balanceRead1 = conn1.prepareStatement("select balance from account where id = 1").executeQuery()
+            balanceRead1.next()
+            addToBalance(conn1, balanceRead1.getInt(1) + 100)
 
-            var firstCustomerReading = conn1
-                .prepareStatement(selectStatement)
-                .executeQuery()
-            Assertions.assertTrue(!firstCustomerReading.next())
-
-            //Reading of the first customer is closed
-            conn1.commit()
-
-            itemRepository.save(Item(1L, 1L, 1))
-
-            val secondCustomerReading = conn2
-                .prepareStatement(selectStatement)
-                .executeQuery()
-            Assertions.assertTrue(secondCustomerReading.next())
-
-            conn2.prepareStatement("update items set quantity = quantity - 1 where id = 1 and store_id = 1")
-                .executeUpdate()
-
-            firstCustomerReading = conn1
-                .prepareStatement(selectStatement)
-                .executeQuery()
-            Assertions.assertTrue(firstCustomerReading.next())
-
+            val balanceRead2 = conn2.prepareStatement("select balance from account where id = 1").executeQuery()
+            balanceRead2.next()
+            conn1.rollback()
+            addToBalance(conn2, balanceRead2.getInt(1) + 100)
             conn2.commit()
 
-            conn1.prepareStatement("update items set quantity = quantity - 1 where id = 1 and store_id = 1")
-                .executeUpdate()
-            conn1.commit()
+            val account = accountRepository.findById(1L).orElseThrow { AssertionError("No account found") }
 
             Assertions.assertThrows(AssertionError::class.java) {
-                Assertions.assertTrue(itemRepository.findById(1L).get().quantity >= 0)
-            }
-        } catch (e: Exception) {
-            Assertions.fail("Unexpected exception", e)
-        } finally {
-            conn1.close()
-            conn2.close()
-        }
-    }
-
-    //THERE ARE POSITIVE SCENARIOS TOO:)
-
-    /**
-     * There is 500$ on the bank account. A man in a bank office
-     * getting all the money from the account (500$).
-     * At the same time his wife is in another office adds 1000$ to the account.
-     *
-     * Now to add 1000$ we use SQL updating.
-     *
-     * Since the first transaction isn't commited yet, updating isn't possible.
-     * ReadCommited level blocks a row from other transaction updates
-     *
-     * Having 1500$ in temporary impossible; at least not possible in the first wife's reading
-     */
-    @Test
-    @DirtiesContext
-    fun `reading in T1, updating and deleting in T2, and updating in T1 via SQL`() {
-        val conn1 = DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD)
-        val conn2 = DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD)
-        try {
-            conn1.autoCommit = false
-            conn2.autoCommit = false
-
-            val accRead1 = getAccount(conn1)
-            val accRead2 = getAccount(conn2)
-
-            accRead1.next()
-            accRead2.next()
-
-            val balanceRead1 = accRead1.getInt(1)
-            val balanceRead2 = accRead1.getInt(1)
-
-            reduceBalance(conn1, balanceRead1)
-
-            Assertions.assertThrows(JdbcSQLTimeoutException::class.java) {
-                conn2.prepareStatement("update account set balance = ${balanceRead2 + 1000} where id = 1")
-                    .executeUpdate()
-            }
-        } catch (e: Exception) {
-            Assertions.fail("Unexpected exception", e)
-        } finally {
-            conn1.close()
-            conn2.close()
-        }
-    }
-
-    /**
-     * There is 500$ on the bank account. A man in a bank office
-     * getting all the money from the account (500$).
-     * At the same time his wife is in another office adds 1000$ to the account.
-     *
-     * Now to add 1000$ we use @Transactional updating.
-     *
-     * Since the first transaction isn't commited yet, updating isn't possible.
-     * ReadCommited level blocks a row from other transaction updates
-     *
-     * Having 1500$ in temporary impossible; at least not possible in the first wife's reading
-     */
-    @Test
-    @DirtiesContext
-    fun `reading in T1, updating and deleting in T2, and updating in T1 via Spring Transaction`() {
-        val conn1 = DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD)
-        try {
-            conn1.autoCommit = false
-
-            val accRead1 = getAccount(conn1)
-
-            accRead1.next()
-
-            val balanceRead1 = accRead1.getInt(1)
-            val balanceRead2 = accountRepository.findById(1L).get()
-
-            reduceBalance(conn1, balanceRead1)
-
-            balanceRead2.balance += 1000
-
-            Assertions.assertThrows(PessimisticLockingFailureException::class.java) {
-                accountService.saveReadCommited(balanceRead2)
+                Assertions.assertTrue(account.balance < 700)
             }
         } catch (e: Exception) {
             Assertions.fail("Unexpected exception", e)
@@ -289,12 +75,8 @@ open class ReadUncommitedTests(
         }
     }
 
-    private fun getAccount(connection: Connection): ResultSet =
-        connection.prepareStatement("select * from account where id = 1").executeQuery()
-
-    private fun reduceBalance(connection: Connection, balance: Int) {
-        val update = connection.prepareStatement("update account set balance = ? where id = 1")
-        update.setInt(1, balance)
+    private fun addToBalance(connection: Connection, balance: Int) {
+        val update = connection.prepareStatement("update account set balance = $balance where id = 1")
         update.executeUpdate()
     }
 }
