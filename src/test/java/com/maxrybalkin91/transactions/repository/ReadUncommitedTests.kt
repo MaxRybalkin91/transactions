@@ -1,14 +1,12 @@
 package com.maxrybalkin91.transactions.repository
 
-import com.maxrybalkin91.transactions.model.Account
 import com.maxrybalkin91.transactions.util.DbSettings.DB_PASSWORD
 import com.maxrybalkin91.transactions.util.DbSettings.DB_URL
 import com.maxrybalkin91.transactions.util.DbSettings.DB_USER
-import jakarta.annotation.PostConstruct
 import org.junit.jupiter.api.Assertions
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Order
 import org.junit.jupiter.api.Test
-import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.context.SpringBootTest
 import org.springframework.test.annotation.DirtiesContext
 import java.sql.Connection
@@ -18,19 +16,29 @@ import java.sql.DriverManager
  * "Read Uncommited" isolation level cases
  */
 @SpringBootTest
-open class ReadUncommitedTests(
-    @Autowired private val accountRepository: AccountRepository
-) {
-    @PostConstruct
+open class ReadUncommitedTests {
+    @BeforeEach
     fun fillDb() {
-        val account1 = Account(500)
-        accountRepository.save(account1)
+        DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD).use {
+            it.prepareStatement("delete from account where id = 1")
+                .executeUpdate()
+            it.prepareStatement("insert into account(id, balance) values(1, 500)")
+                .executeUpdate()
+            it.commit()
+            it.close()
+        }
     }
 
     @Test
     @Order(1)
     fun checkNotEmptyDb() {
-        Assertions.assertNotEquals(0, accountRepository.count())
+        DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD).use {
+            Assertions.assertTrue(
+                it.prepareStatement("select * from account")
+                    .executeQuery()
+                    .next()
+            )
+        }
     }
 
     /**
@@ -63,10 +71,10 @@ open class ReadUncommitedTests(
             addToBalance(conn2, balanceRead2.getInt(1) + 100)
             conn2.commit()
 
-            val account = accountRepository.findById(1L).orElseThrow { AssertionError("No account found") }
-
             Assertions.assertThrows(AssertionError::class.java) {
-                Assertions.assertTrue(account.balance < 700)
+                val balanceRead3 = conn1.prepareStatement("select balance from account where id = 1").executeQuery()
+                Assertions.assertTrue(balanceRead3.next())
+                Assertions.assertTrue(balanceRead3.getInt(1) < 700)
             }
         } catch (e: Exception) {
             Assertions.fail("Unexpected exception", e)
