@@ -32,6 +32,8 @@ open class SerializableTests {
                 .executeUpdate()
 
             conn1.transactionIsolation = Connection.TRANSACTION_SERIALIZABLE
+            conn2.transactionIsolation = Connection.TRANSACTION_SERIALIZABLE
+
             conn1.autoCommit = false
 
             conn2.autoCommit = false
@@ -41,6 +43,7 @@ open class SerializableTests {
 
             val searchingRead = conn1.prepareStatement("select id from employee where birthday = '2000-01-01'")
                 .executeQuery()
+            conn1.commit()
             val ids = arrayListOf<Int>()
             while (searchingRead.next()) {
                 ids.add(searchingRead.getInt(1))
